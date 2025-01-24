@@ -1,0 +1,109 @@
+// schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DocumentType {
+  image
+  pdf_text
+  pdf_scanned
+}
+
+enum DocumentSubtype {
+  market_receipt
+  credit_card_statement
+  bank_statement
+  service_invoice
+}
+
+enum ExpenseStatus {
+  pending
+  verified
+  rejected
+}
+
+model User {
+  id           Int         @id @default(autoincrement())
+  phoneNumber  String      @unique @db.VarChar(20)
+  documents    Document[]
+  expenses     Expense[]
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @default(now()) @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+model Document {
+  id              Int             @id @default(autoincrement())
+  user            User            @relation(fields: [userId], references: [id])
+  userId          Int             @map("user_id")
+  originalFilename String         @map("original_filename") @db.VarChar(255)
+  storageUrl      String          @map("storage_url") @db.VarChar(512)
+  documentType    DocumentType    @map("document_type")
+  documentSubtype DocumentSubtype? @map("document_subtype")
+  extractedText   String?         @map("extracted_text") @db.Text
+  hashKey         String?         @unique @map("hash_key") @db.VarChar(64)
+  processed       Boolean         @default(false)
+  mimeType        String?         @map("mime_type") @db.VarChar(50)
+  metadata        Json?
+  expenses        Expense[]
+  createdAt       DateTime        @default(now()) @map("created_at")
+
+  @@map("documents")
+}
+
+model ExpenseCategory {
+  id            Int     @id @default(autoincrement())
+  categoryName  String  @unique @map("category_name") @db.VarChar(50)
+  description   String? @db.Text
+  expenses      Expense[]
+  expenseItems  ExpenseItem[]
+
+  @@map("expense_categories")
+}
+
+model Expense {
+  id               Int           @id @default(autoincrement())
+  user             User          @relation(fields: [userId], references: [id])
+  userId           Int           @map("user_id")
+  document         Document?     @relation(fields: [documentId], references: [id])
+  documentId       Int?          @map("document_id")
+  amount           Decimal       @db.Decimal(12, 2)
+  expenseDate      DateTime      @map("expense_date")
+  category         ExpenseCategory? @relation(fields: [categoryId], references: [id])
+  categoryId       Int?          @map("category_id")
+  description      String?       @db.VarChar(255)
+  confidenceScore  Decimal?      @map("confidence_score") @db.Decimal(3, 2)
+  status           ExpenseStatus @default(pending)
+  isItemized       Boolean       @default(false) @map("is_itemized")
+  installmentsInfo Json?         @map("installments_info")
+  metadata         Json?
+  rawData          Json?         @map("raw_data")
+  items            ExpenseItem[]
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @default(now()) @updatedAt @map("updated_at")
+
+  @@index([expenseDate], name: "idx_expenses_date")
+  @@index([categoryId], name: "idx_expenses_category")
+  @@map("expenses")
+}
+
+model ExpenseItem {
+  id          Int      @id @default(autoincrement())
+  expense     Expense  @relation(fields: [expenseId], references: [id])
+  expenseId   Int      @map("expense_id")
+  description String   @db.VarChar(255)
+  quantity    Decimal? @db.Decimal(8, 2)
+  unitPrice   Decimal  @map("unit_price") @db.Decimal(12, 2)
+  category    ExpenseCategory? @relation(fields: [categoryId], references: [id])
+  categoryId  Int?     @map("category_id")
+  rawData     Json?    @map("raw_data")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@map("expense_items")
+}
