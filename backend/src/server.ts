@@ -1,11 +1,12 @@
 import express from "express";
 import { Twilio } from "twilio";
-import dotenv from "dotenv";
+
 import path from "path";
 import { ImageAnnotatorClient } from "@google-cloud/vision";
 import axios from "axios";
 import OpenAI from "openai";
-
+import pdf from "pdf-parse";
+import dotenv from "dotenv";
 dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
 
 const app = express();
@@ -30,7 +31,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Função para baixar arquivos
+// Renomeie a função para propósito genérico
 async function downloadFile(url: string): Promise<Buffer> {
   const response = await axios.get(url, {
     responseType: "arraybuffer",
@@ -42,25 +43,41 @@ async function downloadFile(url: string): Promise<Buffer> {
   return Buffer.from(response.data, "binary");
 }
 
+// Função para extrair texto de PDFs textuais
+async function extractTextFromPDF(buffer: Buffer): Promise<string> {
+  try {
+    const data = await pdf(buffer);
+    return data.text;
+  } catch (error) {
+    throw new Error("Falha ao extrair texto do PDF");
+  }
+}
 async function processTextWithAI(text: string): Promise<string> {
   try {
     const completion = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo", // ou "gpt-3.5-turbo" para versão mais econômica
+      model: "gpt-3.5-turbo",
       messages: [
         {
           role: "system",
-          content:
-            "Você é um assistente financeiro especialista em analisar extratos bancários, faturas e recibos. Formate a resposta com emojis e itens.",
+          content: `Analise o texto extraído de um documento financeiro (pode ser de um PDF) e identifique:
+1. Valor total (R$)
+2. Data (DD/MM/AAAA)
+3. Estabelecimento/Nome do favorecido
+4. Tipo de despesa (Alimentação, Transporte, Saúde, etc.)
+5. Se for uma fatura de cartão de crédito analise e agrupe as compras no cartão por tipos e valores de cada tipo de despesa
+6. Resumo em 10 palavras
+
+Formato da resposta:
+💰 Valor: [valor]
+📅 Data: [data]
+🏪 Estabelecimento: [nome]
+📦 Tipo: [tipo]
+💰 Valor Detalhado: [valor por categoria identificada, caso não consiga identificar marque como "outros"]
+📝 Resumo: [resumo]`,
         },
         {
           role: "user",
-          content: `Analise este texto extraído de um documento financeiro e me diga:
-1. Valor total
-2. Data da transação
-3. Estabelecimento/comerciante
-4. Tipo de gasto (alimentação, transporte, etc.)
-          
-Texto: ${text.substring(0, 3000)}`, // Limitando para controlar custos
+          content: `Texto para análise: ${text.substring(0, 100000)}`,
         },
       ],
     });
@@ -74,25 +91,48 @@ Texto: ${text.substring(0, 3000)}`, // Limitando para controlar custos
     return "Erro ao processar o documento";
   }
 }
-// Rota do Webhook
+// Modifique a rota do webhook
 app.post("/webhook", async (req, res) => {
   const userMessage = req.body?.Body;
   const userPhone = req.body?.From;
   const mediaUrl = req.body?.MediaUrl0;
+  const mediaType = req.body?.MediaContentType0;
 
   try {
     let responseMessage = "✅ Mensagem recebida!";
 
     if (mediaUrl) {
-      const imageBuffer = await downloadFile(mediaUrl);
-      const [result] = await visionClient.textDetection(imageBuffer);
-      const extractedText =
-        result.fullTextAnnotation?.text || "Texto não encontrado.";
+      const fileBuffer = await downloadFile(mediaUrl);
+      let extractedText = "";
 
-      // Chamada nova para a OpenAI
+      // Processamento diferente para PDFs
+      if (mediaType === "application/pdf") {
+        try {
+          // Tentativa de extração de PDF textual
+          extractedText = await extractTextFromPDF(fileBuffer);
+          console.log(extractedText);
+          // Verifica se o texto é válido
+          if (extractedText.length < 50) {
+            throw new Error("PDF possivelmente escaneado");
+          }
+        } catch (error) {
+          // Fallback para Google Vision se for PDF escaneado
+          const [result] = await visionClient.textDetection(fileBuffer);
+          extractedText = result.fullTextAnnotation?.text || "";
+
+          if (!extractedText) {
+            throw new Error("Não foi possível ler o PDF");
+          }
+        }
+      } else {
+        // Processamento normal para imagens
+        const [result] = await visionClient.textDetection(fileBuffer);
+        extractedText = result.fullTextAnnotation?.text || "";
+      }
+
+      // Processamento com OpenAI
       const aiResponse = await processTextWithAI(extractedText);
-
-      responseMessage = `📊 Análise do documento:\n\n${aiResponse}`;
+      responseMessage = `📄 Documento analisado:\n\n${aiResponse}`;
     }
 
     await twilioClient.messages.create({
@@ -104,6 +144,19 @@ app.post("/webhook", async (req, res) => {
     res.status(200).send("OK");
   } catch (error) {
     console.error("Erro:", error);
+
+    // Mensagem de erro específica para PDFs
+    const errorMessage =
+      mediaType === "application/pdf"
+        ? "⚠️ PDF escaneado detectado! Envie cada página como imagem separada para análise completa."
+        : "Erro ao processar o arquivo";
+
+    await twilioClient.messages.create({
+      body: errorMessage,
+      from: process.env.TWILIO_PHONE_NUMBER!,
+      to: userPhone,
+    });
+
     res.status(500).send("Erro interno");
   }
 });
