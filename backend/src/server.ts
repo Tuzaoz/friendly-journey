@@ -1,18 +1,19 @@
 import express from 'express';
-import { Twilio } from 'twilio';
 
-import { ImageAnnotatorClient } from '@google-cloud/vision';
 import { PrismaClient } from '@prisma/client';
-import axios from 'axios';
 import dotenv from 'dotenv';
-import OpenAI from 'openai';
 import path from 'path';
-import pdf from 'pdf-parse';
-import { convertToJsonPrompt } from './utils/corvertToJsonPrompt';
+import { openai, twilioClient, visionClient } from './config';
+import { downloadFile } from './utils/fileOperations';
 import {
   analyzeMessageIntent,
   executeQuery,
 } from './utils/generatePrismaQuery';
+import {
+  extractTextFromPDF,
+  OCRProcessingError,
+  processOCRText,
+} from './utils/textProcessing';
 
 dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
 export const prisma = new PrismaClient({
@@ -23,101 +24,88 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 const port = process.env.PORT || 3000;
 
-// Configuração dos clientes
-const visionClient = new ImageAnnotatorClient({
-  credentials: {
-    client_email: process.env.GOOGLE_CLIENT_EMAIL,
-    private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-  },
-});
-
-const twilioClient = new Twilio(
-  process.env.TWILIO_ACCOUNT_SID!,
-  process.env.TWILIO_AUTH_TOKEN!,
-);
-
-export const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// Renomeie a função para propósito genérico
-async function downloadFile(url: string): Promise<Buffer> {
-  const response = await axios.get(url, {
-    responseType: 'arraybuffer',
-    auth: {
-      username: process.env.TWILIO_ACCOUNT_SID!,
-      password: process.env.TWILIO_AUTH_TOKEN!,
-    },
-  });
-  return Buffer.from(response.data, 'binary');
-}
-
-// Função para extrair texto de PDFs textuais
-async function extractTextFromPDF(buffer: Buffer): Promise<string> {
-  try {
-    const data = await pdf(buffer);
-    return data.text;
-  } catch (error) {
-    throw new Error('Falha ao extrair texto do PDF');
-  }
-}
-
 function extractNumber(whatsAppText: string) {
   const plusIndex = whatsAppText.indexOf('+');
   return whatsAppText.substring(plusIndex, whatsAppText.length);
 }
-async function processTextWithAI(text: string): Promise<string> {
-  try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-3.5-turbo',
-      messages: [
-        {
-          role: 'system',
-          content: `Analise o texto extraído de um documento financeiro (pode ser de um PDF) e identifique:
-1. Valor total (R$)
-2. Data (DD/MM/AAAA)
-3. Estabelecimento/Nome do favorecido
-4. Tipo de despesa (Alimentação, Transporte, Saúde, etc.)
-5. Se for uma fatura de cartão de crédito analise e agrupe as compras no cartão por tipos e valores de cada tipo de despesa
-6. Resumo em 10 palavras
 
-Formato da resposta:
-💰 Valor: [valor]
-📅 Data: [data]
-🏪 Estabelecimento: [nome]
-📦 Tipo: [tipo]
-💰 Valor Detalhado: [valor por categoria identificada, caso não consiga identificar marque como "outros"]
-📝 Resumo: [resumo]`,
-        },
-        {
-          role: 'user',
-          content: `Texto para análise: ${text.substring(0, 100000)}`,
-        },
-      ],
-    });
+async function generateNaturalResponse(
+  result: any,
+  question: string,
+  searchTerm?: string,
+) {
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-3.5-turbo',
+    messages: [
+      {
+        role: 'system',
+        content: `Você é um assistente financeiro especializado em traduzir dados brutos em respostas naturais e amigáveis. Siga estas regras:
 
-    return (
-      completion.choices[0].message.content ||
-      'Não consegui analisar o documento'
-    );
-  } catch (error) {
-    console.error('Erro na OpenAI:', error);
-    return 'Erro ao processar o documento';
-  }
+1. **Formatação Humanizada:**
+   - Valores monetários: Sempre formate como "R$ X,XX"
+   - Datas: Use "dia X de [mês] de YYYY" (ex: 15 de março de 2023)
+   - Listas: Destacar 3-5 itens principais quando relevante
+
+2. **Elementos Obrigatórios:**
+   - Emojis temáticos no início da resposta
+   - Menção ao período analisado quando aplicável
+   - Comparação percentual com períodos anteriores (se dados disponíveis)
+   - Dica de economia relacionada à pergunta
+
+3. **Proibições Estritas:**
+   - ❌ Termos técnicos: "query", "join", "aggregate", "database"
+   - ❌ Notação científica/códigos
+   - ❌ Referências à estrutura de dados
+
+4. **Tom e Estilo:**
+   - Coloquial mas profissional (nível médio de formalidade)
+   - Frases curtas (máx. 15 palavras)
+   - Uso de metáforas financeiras cotidianas
+
+Exemplo de resposta ruim ❌:
+"O aggregate result da query foi 152.30 na sum do amount"
+
+Exemplo de resposta boa ✅:
+"🍺 Nas suas últimas compras, você gastou R$ 152,30 com bebidas. Isso equivale a cerca de 12% do seu orçamento mensal para alimentação. Que tal experimentar marcas locais na próxima vez? 😊"
+
+Formato desejado:
+[Emoji] [Introdução contextual] [Valor principal] [Detalhe relevante] [Dica ou curiosidade] [Emoji final]`,
+      },
+      {
+        role: 'user',
+        content: `Dados brutos: ${JSON.stringify(result)}
+Pergunta original: "${question}"
+Termo buscado: ${searchTerm || 'N/A'}
+---
+Gerar resposta usando: 
+- Moeda: BRL 
+- Período: último mês 
+- Categorias relacionadas: alimentação, transporte, lazer`,
+      },
+    ],
+    temperature: 0.3,
+    max_tokens: 150,
+  });
+
+  return completion.choices[0].message.content;
 }
+
 app.post('/webhook', async (req, res) => {
   const userPhone = req.body?.From;
-  const mediaUrl = req.body?.MediaUrl0;
-  const mediaType = req.body?.MediaContentType0;
-  const hasMedia = !!req.body?.MediaUrl0;
+  const mediaUrls = [];
+  const mediaTypes = [];
+
+  // Coletar todas as mídias enviadas
+  let mediaCount = 0;
+  while (req.body[`MediaUrl${mediaCount}`]) {
+    mediaUrls.push(req.body[`MediaUrl${mediaCount}`]);
+    mediaTypes.push(req.body[`MediaContentType${mediaCount}`]);
+    mediaCount++;
+  }
+
+  const hasMedia = mediaUrls.length > 0;
   const messageText = req.body?.Body || '';
   let responseMessage;
-  // let responseMessage = '✅ Documento recebido! Analisando...';
-  // await twilioClient.messages.create({
-  //   body: responseMessage,
-  //   from: process.env.TWILIO_PHONE_NUMBER!,
-  //   to: userPhone,
-  // });
 
   try {
     const messageAnalysis = await analyzeMessageIntent(messageText, hasMedia);
@@ -130,123 +118,145 @@ app.post('/webhook', async (req, res) => {
       if (!user) {
         throw new Error('Usuário não encontrado');
       }
-      console.log('Usuário:', user);
       const response = await executeQuery(messageAnalysis, user.id);
-
-      // await twilioClient.messages.create({
-      //   body: response,
-      //   from: process.env.TWILIO_PHONE_NUMBER!,
-      //   to: userPhone,
-      // });
+      responseMessage = await generateNaturalResponse(
+        JSON.stringify(response),
+        messageText,
+        messageAnalysis.sqlQuery,
+      );
+      await twilioClient.messages.create({
+        body: responseMessage || 'Sem resposta',
+        from: process.env.TWILIO_PHONE_NUMBER!,
+        to: userPhone,
+      });
 
       res.status(200).send('OK');
     } else {
-      if (mediaUrl) {
-        // 1. Download do arquivo
-        const fileBuffer = await downloadFile(mediaUrl);
+      if (mediaUrls.length > 0) {
+        const processedDocuments = [];
 
-        // 2. Extração de texto
-        let extractedText = '';
-        if (mediaType === 'application/pdf') {
-          extractedText = await extractTextFromPDF(fileBuffer);
-        } else {
-          const [visionResult] = await visionClient.textDetection(fileBuffer);
-          extractedText = visionResult.fullTextAnnotation?.text || '';
-        }
+        // Processar cada mídia sequencialmente
+        for (const [index, mediaUrl] of mediaUrls.entries()) {
+          const mediaType = mediaTypes[index];
 
-        // 3. Processamento com OpenAI
-        const analysisResult = await processOCRText(extractedText);
+          // 1. Download do arquivo
+          const fileBuffer = await downloadFile(mediaUrl);
 
-        // 4. Encontrar ou criar usuário
-        const user = await prisma.user.upsert({
-          where: { phoneNumber: extractNumber(userPhone) },
-          create: { phoneNumber: extractNumber(userPhone) },
-          update: {},
-        });
-
-        // 5. Salvar dados no banco
-        const savedData = await prisma.$transaction(async (tx) => {
-          // Salvar documento
-          const document = await tx.document.create({
-            data: {
-              user: { connect: { id: user.id } },
-              originalFilename: mediaUrl.split('/').pop() || 'documento',
-              storageUrl: mediaUrl,
-              documentType:
-                mediaType === 'application/pdf' ? 'pdf_text' : 'image',
-              extractedText: extractedText.substring(0, 10000), // Limite de 10k caracteres
-              metadata: analysisResult.document.metadata,
-            },
-          });
-
-          // Salvar despesa principal
-          const expense = await tx.expense.create({
-            data: {
-              user: { connect: { id: user.id } },
-              document: { connect: { id: document.id } },
-              amount: analysisResult.expense.amount,
-              expenseDate: analysisResult.expense.date,
-              category: analysisResult.expense.category
-                ? {
-                    connectOrCreate: {
-                      where: { categoryName: analysisResult.expense.category },
-                      create: {
-                        categoryName: analysisResult.expense.category,
-                        description:
-                          'Criado automaticamente via análise de documento',
-                      },
-                    },
-                  }
-                : undefined,
-              confidenceScore: analysisResult.expense.confidence,
-              isItemized: analysisResult.items.length > 0,
-            },
-          });
-
-          // Salvar itens se existirem
-          let savedItems = [];
-          if (analysisResult.items.length > 0) {
-            savedItems = await Promise.all(
-              analysisResult.items.map((item: any) =>
-                tx.expenseItem.create({
-                  data: {
-                    expense: { connect: { id: expense.id } },
-                    description: item.description,
-                    quantity: item.quantity,
-                    unitPrice: item.unitPrice,
-                    category: item.category
-                      ? {
-                          connectOrCreate: {
-                            where: { categoryName: item.category },
-                            create: {
-                              categoryName: item.category,
-                              description:
-                                'Criado automaticamente via item de documento',
-                            },
-                          },
-                        }
-                      : undefined,
-                  },
-                }),
-              ),
-            );
+          // 2. Extração de texto
+          let extractedText = '';
+          if (mediaType === 'application/pdf') {
+            extractedText = await extractTextFromPDF(fileBuffer);
+          } else {
+            const [visionResult] = await visionClient.textDetection(fileBuffer);
+            extractedText = visionResult.fullTextAnnotation?.text || '';
           }
 
-          return { document, expense, items: savedItems };
-        });
+          // 3. Processamento com OpenAI
+          const analysisResult = await processOCRText(extractedText);
 
-        // 6. Montar resposta para usuário
-        responseMessage = `📊 Análise concluída!\n
-Valor total: R$${savedData.expense.amount.toFixed(2)}
-Data: ${savedData.expense.expenseDate.toLocaleDateString('pt-BR')}
-${
-  savedData.items.length > 0
-    ? `Itens detectados: ${savedData.items.length}`
-    : ''
-}`;
+          // 4. Encontrar ou criar usuário
+          const user = await prisma.user.upsert({
+            where: { phoneNumber: extractNumber(userPhone) },
+            create: { phoneNumber: extractNumber(userPhone) },
+            update: {},
+          });
+
+          // 5. Salvar dados no banco
+          const savedData = await prisma.$transaction(async (tx) => {
+            // Salvar documento
+            const document = await tx.document.create({
+              data: {
+                user: { connect: { id: user.id } },
+                originalFilename: mediaUrl.split('/').pop() || 'documento',
+                storageUrl: mediaUrl,
+                documentType:
+                  mediaType === 'application/pdf' ? 'pdf_text' : 'image',
+                extractedText: extractedText.substring(0, 10000), // Limite de 10k caracteres
+                metadata: analysisResult.document.metadata,
+              },
+            });
+
+            // Salvar despesa principal
+            const expense = await tx.expense.create({
+              data: {
+                user: { connect: { id: user.id } },
+                document: { connect: { id: document.id } },
+                amount: analysisResult.expense.amount,
+                expenseDate: analysisResult.expense.date,
+                category: analysisResult.expense.category
+                  ? {
+                      connectOrCreate: {
+                        where: {
+                          categoryName: analysisResult.expense.category,
+                        },
+                        create: {
+                          categoryName: analysisResult.expense.category,
+                          description:
+                            'Criado automaticamente via análise de documento',
+                        },
+                      },
+                    }
+                  : undefined,
+                confidenceScore: analysisResult.expense.confidence,
+                isItemized: analysisResult.items.length > 0,
+              },
+            });
+
+            // Salvar itens se existirem
+            let savedItems = [];
+            if (analysisResult.items.length > 0) {
+              savedItems = await Promise.all(
+                analysisResult.items.map((item: any) =>
+                  tx.expenseItem.create({
+                    data: {
+                      expense: { connect: { id: expense.id } },
+                      description: item.description,
+                      quantity: item.quantity,
+                      unitPrice: item.unitPrice,
+                      totalAmount: item.quantity * item.unitPrice,
+                      category: item.category
+                        ? {
+                            connectOrCreate: {
+                              where: { categoryName: item.category },
+                              create: {
+                                categoryName: item.category,
+                                description:
+                                  'Criado automaticamente via item de documento',
+                              },
+                            },
+                          }
+                        : undefined,
+                    },
+                  }),
+                ),
+              );
+            }
+
+            return { document, expense, items: savedItems };
+          });
+
+          processedDocuments.push({
+            type: mediaType.includes('pdf') ? 'PDF' : 'Imagem',
+            amount: savedData.expense.amount,
+            date: savedData.expense.expenseDate,
+            itemsCount: savedData.items.length,
+          });
+        }
+
+        // 6. Montar resposta consolidada
+        responseMessage = `📊 Análise de ${processedDocuments.length} documentos concluída!\n\n`;
+        responseMessage += processedDocuments
+          .map(
+            (doc, idx) =>
+              `Documento ${idx + 1} (${doc.type}):\n` +
+              `• Valor: R$${doc.amount.toFixed(2)}\n` +
+              `• Data: ${doc.date.toLocaleDateString('pt-BR')}\n` +
+              `• Itens detectados: ${doc.itemsCount}`,
+          )
+          .join('\n\n');
       } else {
         responseMessage =
-          '❌ Arquivo não reconhecido, envie uma imagem ou documento em pdf para análise';
+          '❌ Nenhum arquivo detectado. Envie imagens ou PDFs para análise';
       }
 
       // Enviar resposta via Twilio
@@ -277,70 +287,6 @@ ${
   }
 });
 
-// Implementação da função processOCRText com tratamento de erros
-async function processOCRText(text: string) {
-  try {
-    const extraction = await openai.chat.completions.create({
-      messages: [
-        {
-          role: 'system',
-          content: convertToJsonPrompt.content, // (O prompt completo que mostrei anteriormente)
-        },
-        {
-          role: 'user',
-          content: text.substring(0, 6000), // Limite de tokens
-        },
-      ],
-      model: 'gpt-3.5-turbo',
-      response_format: { type: 'json_object' },
-      temperature: 0.1,
-    });
-
-    const content = extraction.choices[0].message.content;
-    if (!content) {
-      throw new OCRProcessingError('Documento não reconhecido');
-    }
-    const data = JSON.parse(content);
-
-    if (data.error) {
-      throw new OCRProcessingError('Documento não reconhecido');
-    }
-
-    // Validação básica
-    if (!data.main_expense?.total_amount || !data.main_expense?.date) {
-      throw new OCRProcessingError('Dados essenciais faltando');
-    }
-
-    return {
-      document: {
-        type: data.document_type,
-        metadata: data.metadata,
-      },
-      expense: {
-        amount: data.main_expense.total_amount,
-        date: new Date(data.main_expense.date),
-        category: data.main_expense.primary_category,
-        confidence: data.main_expense.confidence_score || 0.8,
-      },
-      items: data.items?.map((item: any) => ({
-        description: item.description,
-        quantity: item.quantity || 1,
-        unitPrice: item.unit_price,
-        category: item.category,
-      })),
-    };
-  } catch (error) {
-    console.error('Erro no processamento com OpenAI:', error);
-    throw new OCRProcessingError('Falha na análise do documento');
-  }
-}
-
-class OCRProcessingError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'OCRProcessingError';
-  }
-}
 app.listen(port, () => {
   console.log(`Servidor rodando em http://localhost:${port}`);
 });

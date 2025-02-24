@@ -1,10 +1,12 @@
-import { openai, prisma } from '../server';
+import { openai } from '../config';
+import {  prisma } from '../server';
 
 // Tipos para as consultas
 interface QueryResult {
   type: 'query';
-  prismaQuery: string;
+  sqlQuery: string;
   naturalResponse: string;
+  includeChart: boolean;
 }
 
 interface DocumentResult {
@@ -71,77 +73,116 @@ export async function analyzeMessageIntent(
   return { type: 'document' };
 }
 
-// Função para gerar consulta Prisma
+// Função para gerar consulta SQL
 async function generatePrismaQuery(
   question: string,
   categories: string,
   queryType: string,
 ): Promise<QueryResult> {
   const completion = await openai.chat.completions.create({
-    model: 'gpt-3.5-turbo',
+    model: 'gpt-4o-2024-08-06',
     messages: [
       {
         role: 'system',
-        content: `Você é um especialista em converter perguntas em consultas Prisma.
-        
-        Schema resumido:
-        - User: id, phoneNumber
-        - Document: id, userId, documentType, documentSubtype, processed
-        - ExpenseCategory: id, categoryName
-        - Expense: id, userId, documentId, amount, expenseDate, categoryId, status(pending/verified/rejected), isItemized
-        - ExpenseItem: id, expenseId, description, quantity, unitPrice, categoryId
+        content: `Você é um especialista em converter perguntas em linguagem natural em consultas SQL para PostgreSQL em um sistema de análise financeira. 
 
-        Regras importantes:
-        1. Sempre inclua userId no where para filtrar por usuário
-        2. Use aggregations (_sum, _avg, _count) quando apropriado
-        3. Para datas, use intervalos (gte/lte)
-        4. Para categorias, use contains/startsWith para busca flexível de nomes sem case sensitive
-        5. Utilize includes quando precisar de dados relacionados
-        6. Limite resultados com take quando retornar listas
-        7. considere as categoryName disponíveis: ${categories}
-        Retorne um JSON:
-        {
-          "prismaQuery": string (código da consulta),
-          "naturalResponse": string (template resposta),
-          "includeChart": boolean (se deve gerar gráfico)
-        }
+Contexto completo do sistema:
+1. Modelagem de Dados:
+   - Documents: Registra recibos/faturas digitalizados (imagens/PDFs)
+   - Expenses: Despesas principais vinculadas a documentos
+   - ExpenseItems: Itens individuais dentro de uma despesa (ex: produtos de supermercado)
+   - ExpenseCategories: Categorias principais (Alimentação, Saúde, etc)
+   - ExpenseSubcategories: Subdivisões especializadas (ex: Bebidas Alcoólicas, Academia)
 
-        Exemplos de queries:
-        1. "Quanto gastei este mês?"
-        {
-          "prismaQuery": "prisma.expense.aggregate({ 
-            where: { 
-              userId,
-              expenseDate: { 
-                gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
-                lt: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1)
-              },
-              status: 'verified'
-            },
-            _sum: { amount: true }
-          })",
-          "naturalResponse": "📊 Seus gastos este mês somam R$ {amount}",
-          "includeChart": false
-        }
+2. Padrões de Busca Comuns:
+   - Agregações temporais (dia/mês/ano)
+   - Comparação entre períodos
+   - Busca por produtos específicos em ExpenseItems
+   - Análise por categoria/subcategoria
+   - Detecção de padrões de gastos
 
-        2. "Gastos por categoria no último trimestre"
-        {
-          "prismaQuery": "prisma.expense.groupBy({
-            by: ['categoryId'],
-            where: {
-              userId,
-              status: 'verified',
-              expenseDate: {
-                gte: new Date(new Date().setMonth(new Date().getMonth() - 3))
-              }
-            },
-            _sum: { amount: true },
-            orderBy: { _sum: { amount: 'desc' } },
-            include: { category: true }
-          })",
-          "naturalResponse": "📈 Gastos por categoria (último trimestre):\\n{categories}",
-          "includeChart": true
-        }`,
+3. Regras Essenciais:
+   *SEMPRE* incluir:
+   - WHERE user_id = :userId 
+   - JOINs corretos entre expenses/items/documents
+   - Tratamento de datas (expense_date)
+   - Conversão monetária (total_amount em BRL)
+   
+4. Estratégias de Busca:
+   (1) Para produtos específicos (ex: "ovos"):
+   - Usar ILIKE em expense_items.description
+   - Considerar sinônimos (ex: "cerveja" inclui "IPA", "lager")
+   
+   (2) Para subcategorias:
+   - JOIN com expense_subcategories
+   - Busca semântica (ex: "academia" → "Atividades Esportivas")
+
+   (3) Para documentos:
+   - Relacionar com document_type/subtype
+   - Considerar payment_method no metadata
+
+   Regras temporais obrigatórias:
+1. Para meses sem ano especificado (ex: "janeiro"):
+   - Usar EXTRACT(MONTH FROM e.expense_date) = 1 (janeiro)
+   - E EXTRACT(YEAR FROM e.expense_date) = EXTRACT(YEAR FROM CURRENT_DATE)
+   
+2. Sempre usar CURRENT_DATE como referência temporal
+3. Nunca usar datas fixas (ex: '2023-01-01')
+Exemplos Avançados:
+
+1. "Valor gasto com cerveja último mês":
+SELECT SUM(total_amount) as total, COUNT(*)
+FROM expense_items ei
+JOIN expenses e ON e.id = ei.expense_id
+LEFT JOIN expense_subcategories es ON es.id = ei.subcategory_id
+WHERE e.user_id = :userId
+  AND e.expense_date >= NOW() - INTERVAL '1 month'
+  AND (ei.description ILIKE '%cerveja%' 
+       OR es.name ILIKE '%bebidas alcoólicas%')
+
+2. "Histórico de preços de ovos":
+SELECT ei.description, ei.unit_price, e.expense_date
+FROM expense_items ei
+JOIN expenses e ON e.id = ei.expense_id
+WHERE e.user_id = :userId
+  AND ei.description ILIKE '%ovos%'
+ORDER BY e.expense_date DESC
+
+3. "Comparativo mensal de alimentação":
+SELECT 
+  DATE_TRUNC('month', e.expense_date) as mes,
+  SUM(ei.total_amount) as total
+FROM expense_items ei
+JOIN expenses e ON e.id = ei.expense_id
+JOIN expense_categories ec ON ec.id = ei.category_id
+WHERE e.user_id = :userId
+  AND ec.category_name = 'Alimentação'
+GROUP BY mes
+ORDER BY mes DESC
+LIMIT 6
+
+4. "Detalhamento de última compra no mercado":
+SELECT ei.description, ei.quantity, ei.unit_price, ei.total_amount
+FROM expense_items ei
+JOIN expenses e ON e.id = ei.expense_id
+JOIN documents d ON d.id = e.document_id
+WHERE e.user_id = :userId
+  AND d.document_subtype = 'market_receipt'
+ORDER BY e.expense_date DESC
+LIMIT 10
+
+Gere SQL que:
+- Priorize performance (use índices existentes)
+- Trate dados faltantes (COALESCE)
+- Previna SQL injection (não interpolar valores)
+- Use alias claros (ex: total_mensal)
+- Limite resultados quando aplicável
+- Retorne um JSON com o seguinte formato: {
+  "sqlQuery": "SELECT ... FROM ... WHERE ...",
+  "naturalResponse": "Resposta natural para a pergunta",
+  "includeChart": true
+      }`
+
       },
       {
         role: 'user',
@@ -158,23 +199,19 @@ async function generatePrismaQuery(
   };
 }
 
-// Função para executar a consulta e formatar resposta
+// Nova função de execução com SQL
 export async function executeQuery(queryResult: QueryResult, userId: number) {
   try {
-    const queryFunction = new Function(
-      'prisma',
-      'userId',
-      'Date',
-      `return ${queryResult.prismaQuery}`,
+    console.log('Executando query:', queryResult.sqlQuery);
+    
+    const results = await prisma.$queryRawUnsafe(
+      queryResult.sqlQuery.replace(/:userId/g, userId.toString())
     );
 
-    const results = await queryFunction(prisma, userId, Date);
-
-    // Formatar resposta baseado nos resultados
-    console.log('Resultados:', results._sum.amount);
+    console.log('Resultados:', results);
     return results;
   } catch (error) {
-    console.error('Erro ao executar query:', error);
-    return '❌ Desculpe, não consegui processar sua consulta. Tente reformular a pergunta.';
+    console.error('Erro na execução SQL:', error);
+    return '❌ Erro ao processar sua solicitação. Tente reformular a pergunta.';
   }
 }

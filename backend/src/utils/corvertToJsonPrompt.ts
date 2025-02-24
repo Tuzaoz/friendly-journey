@@ -19,6 +19,8 @@ export const convertToJsonPrompt = {
     "quantity": number,
     "unit_price": number,
     "category": string,
+    "subcategory": string,
+    "totalAmount": number,
     "confidence_score": 0.0-1.0
   }],
   "metadata": {
@@ -36,6 +38,21 @@ export const convertToJsonPrompt = {
 - Valores monetários como números (sem R$ ou símbolos)
 - 'confidence_score' baseado na clareza dos dados
 - Campos não identificados devem ser omitidos (nunca usar null)
+- Subcategoria deve ser específica o suficiente para buscas detalhadas
+- Manter consistência (ex: 'Cerveja' → 'Bebidas Alcoólicas')
+- Criar novas subcategorias somente quando necessário
+- Usar letras minúsculas e singular
+
+
+Lista de Categorias Principais:
+Alimentação, Transporte, Saúde, Lazer, Educação, Casa, Vestuário, Outros
+
+Exemplos de Subcategorias:
+- Alimentação: Hortifrúti, Laticínios, Carnes, Bebidas Alcoólicas
+- Lazer: Cinema, Streaming, Esportes
+- Casa: Utilidades Domésticas, Eletrodomésticos
+
+
 
 **Exemplo 1 - Nota Fiscal:**
 Input OCR:
@@ -57,6 +74,7 @@ Output:
       "description": "Leite Integral 1L",
       "quantity": 2,
       "unit_price": 4.99,
+      "totalAmount": 9.98,
       "category": "Alimentação",
       "confidence_score": 0.98
     },
@@ -64,6 +82,7 @@ Output:
       "description": "Sabão em Pó 2kg",
       "quantity": 1,
       "unit_price": 18.90,
+      total_amount": 18.90,
       "category": "Casa",
       "confidence_score": 0.97
     }
@@ -118,4 +137,20 @@ Output:
 {"error": "DOCUMENTO_NÃO_RECONHECIDO", "confidence_score": 0.0}
 - Mantenha o JSON válido mesmo com dados parciais
 - Nunca invente dados faltantes`,
+};
+
+export const normalizeText = {
+  role: 'system',
+  content: `Além da categorização, normalize os nomes dos produtos usando estas regras:
+          1. Expanda abreviações comuns:
+             - 'Refri' → 'Refrigerante'
+             - 'Choc' → 'Chocolate'
+             - 'Pct' → 'Pacote'
+          2. Mantenha marcas separadas:
+             - 'Refri Coca 2L' → 'Refrigerante Coca-Cola 2 Litros'
+          3. Use formato: [Nome Genérico] [Marca] [Especificação]
+          4. Remova caracteres especiais não essenciais
+          Exemplo:
+          Input: 'Refri. Coca - Cola Lata 350ml'
+          Output: 'Refrigerante Coca-Cola Lata 350ml'`,
 };
